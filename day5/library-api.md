@@ -39,3 +39,49 @@ REST API design documentation for the Library's **Books** resource.
     "publishedYear": 2008,
     "isbn": "978-0132350884"
   }
+  ```
+* **Success Status Code:** `201 Created`
+
+### 5. Update a Book
+* **Method:** `PUT`
+* **Path:** `/api/v1/books/{id}`
+* **Description:** Replaces the details of an existing book by its unique ID.
+* **Request Body Example:**
+  ```json
+  {
+    "title": "Clean Code: A Handbook of Agile Software Craftsmanship",
+    "author": "Robert C. Martin",
+    "publishedYear": 2008,
+    "isbn": "978-0132350884"
+  }
+  ```
+* **Success Status Code:** `200 OK`
+
+### 6. Delete a Book
+* **Method:** `DELETE`
+* **Path:** `/api/v1/books/{id}`
+* **Description:** Removes the book with the specified ID from the library catalog.
+* **Request Body:** None
+* **Success Status Code:** `204 No Content`
+
+## Error Responses
+
+### `400 Bad Request`
+The request contains invalid data, so the API cannot process it. For example, creating a book with a text value for `publishedYear` instead of a number should return `400 Bad Request`:
+
+```json
+{
+  "error": "Invalid request",
+  "message": "publishedYear must be a number."
+}
+```
+
+### `404 Not Found`
+The request is valid, but the requested book ID does not exist. For example, requesting `GET /api/v1/books/9999` should return `404 Not Found` if there is no book with ID `9999`:
+
+```json
+{
+  "error": "Not found",
+  "message": "No book exists with ID 9999."
+}
+```

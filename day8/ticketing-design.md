@@ -82,40 +82,54 @@ Expired holds are reclaimed by a worker using a conditional update that checks b
                                     |
                          +----------v-----------+
                          | API Gateway & Auth   |
-                         +----+-------------+---+
-                              |             |
-                   browse/read|             | queue / purchase
-                              |             v
-                    +---------v----+  +------+----------------+
-                    | Event Cache  |  | Virtual Queue Service |
-                    | + Read API   |  +-----------+------------+
-                    +---------+----+              |
-                              |                    v
-                              |          +---------+----------+
-                              +--------->| Ticketing Service  |
-                                         +---+------------+---+
-                                             |            |
-                                      transaction      payment intent
-                                             |            v
-                                    +--------v---+  +-----+------------+
-                                    | Relational |  | Payment Provider |
-                                    | Database   |  +------------------+
-                                    +-----+------+
-                                          |
-                                 outbox / retryable events
-                                          v
-                                  +-------+--------+
-                                  | Workers: hold  |
-                                  | expiry, tickets|
-                                  | reconciliation |
-                                  +----------------+
+                         +----+----------------+---+
+                              |                |
+                   browse/read|                | join sale
+                              |                v
+                    +---------v----+  +--------+-----------+
+                    | Event Cache  |  | Virtual Queue     |
+                    | + Read API   |  | Service           |
+                    +---------+----+  +----+----------+---+
+                              |            |          ^
+                              |          enqueue      | queue position
+                              |            v          |
+                              |     +------+----------+---+
+                              |     | Durable Queue Store |
+                              |     +------+--------------+
+                              |            |
+                              |    rate-limited admission
+                              |    tokens (no ticket-DB connection
+                              |       while waiting)
+                              |            v
+                              |     +------+-------------+
+                              +---->| Ticketing Service  |-----> Payment Provider
+                                    | bounded DB workers |
+                                    +------+-------------+
+                                           |
+                                    +------v--------------+
+                                    | DB Connection Pool  |
+                                    | (bounded connections)|
+                                    +------+--------------+
+                                           |
+                                    +------v------+
+                                    | Relational  |
+                                    | Database    |
+                                    +------+------+
+                                           |
+                                  outbox / retryable events
+                                           v
+                                   +-------+--------+
+                                   | Workers: hold  |
+                                   | expiry, tickets|
+                                   | reconciliation |
+                                   +----------------+
 ```
 
 - **Browser/mobile app and CDN:** Deliver the client and cache static assets close to users.
 - **API gateway and auth:** Authenticate users, apply request limits, and route API traffic.
 - **Event cache and read API:** Serve cacheable event details and seat-map snapshots. Availability shown here is advisory; the hold transaction rechecks it.
-- **Virtual queue service:** Orders and rate-limits sale entrants, then issues short-lived admission tokens. It reduces overload but is not the source of seat ownership.
-- **Ticketing service:** Validates admission tokens, creates holds, coordinates checkout, and applies idempotency rules.
+- **Virtual queue service and durable queue store:** Enqueue sale entrants and report their positions using the queue store, separately from the ticketing relational database connection pool. The service admits a bounded number at a time, issuing short-lived, single-use tokens at a configured rate. While waiting, clients receive position/status from the queue service; they do not poll the ticketing service or consume ticket-database connections.
+- **Ticketing service and database connection pool:** The service validates admission tokens before starting allocation work. A bounded worker/semaphore limits concurrent database transactions, and the connection pool caps open database connections. The admission rate is calibrated below the safe write capacity of these workers and the database pool; if workers or connections are saturated, admission pauses rather than allowing requests to pile up holding connections or overwhelm the database. Requests denied or expired at the gate can retry through the queue.
 - **Relational database:** Stores users, event inventory, holds, orders, and tickets; row-level transactional updates and constraints protect seat ownership.
 - **Payment provider:** Handles sensitive payment details and returns payment status through callbacks or status queries.
 - **Workers:** Expire holds, issue ticket notifications, and reconcile delayed or failed payment events. Retryable events are recorded transactionally with database changes (outbox pattern).
@@ -123,6 +137,6 @@ Expired holds are reclaimed by a worker using a conditional update that checks b
 ## 6. Trade-offs
 
 1. **Consistency over availability for seat allocation:** A hold requires a successful database transaction, so an allocation request may fail or wait during a database outage. This avoids selling the same seat twice. Event browsing can remain available from cache with potentially stale availability.
-2. **Virtual queue versus direct access:** The queue adds a step and may frustrate users, but smooths bursts and gives the system controlled admission. Queue order and token expiry must be designed and monitored to maintain fairness.
+2. **Virtual queue versus direct access:** The queue adds waiting time and operational complexity, but absorbs the arrival burst outside the ticketing service and its relational database connection pool. It admits only as many requests as bounded ticketing workers and available database capacity can safely process; users waiting in the durable queue do not consume ticket-database connections. A too-low admission rate leaves capacity unused and lengthens the queue, while a too-high rate can saturate workers, exhaust the connection pool, and recreate the overload. Queue position, admission rate, and token expiry must be monitored and adjusted without bypassing the queue to maintain fairness and protect the database.
 3. **Temporary holds versus immediate purchase:** Holds give users time to pay and reduce checkout races, but temporarily hide seats from other buyers and require expiry/reconciliation logic. Short, explicit expirations limit this inventory lockup.
 4. **Cached seat maps versus live reads:** Caching lowers database load during a sale, but availability can become stale. Showing a clear snapshot timestamp and confirming availability only during the atomic hold operation preserves correctness.

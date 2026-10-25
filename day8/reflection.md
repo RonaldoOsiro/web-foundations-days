@@ -1,0 +1,7 @@
+# Course Reflection
+
+The most difficult concept in this course was concurrency control and race conditions under high traffic. It took a shift from thinking about one request at a time to reasoning about many requests changing shared state simultaneously. I overcame this by drawing transaction flows, practicing database locking examples, and tracing how competing requests for one seat would be resolved. That helped me recognize that the database transaction—not a cached availability display—must enforce the no-double-booking rule.
+
+Based on the feedback I received, I would improve the asynchronous order-processing section of my TicketHub capstone. I would explain how workers recover from failures, how retries avoid duplicate orders or tickets, and how delayed payment-provider callbacks are reconciled with temporary seat holds. I would also make the boundary between payment processing and the database transaction clearer, since they cannot be committed as one atomic operation.
+
+Next, I plan to learn more about reliable backend systems by building a small project with Go and Docker, then adding a message queue and practicing idempotent workers and failure recovery. This will help me test the design ideas from the course in a working system.

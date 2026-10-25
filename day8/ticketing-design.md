@@ -74,69 +74,80 @@ Expired holds are reclaimed by a worker using a conditional update that checks b
 ## 5. Architecture
 
 ```text
-                         +----------------------+
-                         | Browser / Mobile App |
-                         +----------+-----------+
+              200,000 customers attempt purchase within 10 minutes
                                     |
-                           CDN / Web Application
+                    +---------------v----------------+
+                    | CDN / Static Content Cache     |
+                    | absorbs assets; no DB requests |
+                    +---------------+----------------+
                                     |
-                         +----------v-----------+
-                         | API Gateway & Auth   |
-                         +----+----------------+---+
-                              |                |
-                   browse/read|                | join sale
-                              |                v
-                    +---------v----+  +--------+-----------+
-                    | Event Cache  |  | Virtual Queue     |
-                    | + Read API   |  | Service           |
-                    +---------+----+  +----+----------+---+
-                              |            |          ^
-                              |          enqueue      | queue position
-                              |            v          |
-                              |     +------+----------+---+
-                              |     | Durable Queue Store |
-                              |     +------+--------------+
-                              |            |
-                              |    rate-limited admission
-                              |    tokens (no ticket-DB connection
-                              |       while waiting)
-                              |            v
-                              |     +------+-------------+
-                              +---->| Ticketing Service  |-----> Payment Provider
-                                    | bounded DB workers |
-                                    +------+-------------+
-                                           |
-                                    +------v--------------+
-                                    | DB Connection Pool  |
-                                    | (bounded connections)|
-                                    +------+--------------+
-                                           |
-                                    +------v------+
-                                    | Relational  |
-                                    | Database    |
-                                    +------+------+
-                                           |
-                                  outbox / retryable events
-                                           v
-                                   +-------+--------+
-                                   | Workers: hold  |
-                                   | expiry, tickets|
-                                   | reconciliation |
-                                   +----------------+
+                    +---------------v----------------+
+                    | API Gateway                    |
+                    | auth, request limits, routing  |
+                    +-----------+--------------------+
+                                |
+                  +-------------+----------------------+
+                  |                                    |
+       browse/read|                         sale writes|
+                  v                                    v
+       +----------+-----------+             +----------+-----------+
+       | Event / Seat-Map     |             | Virtual Queue        |
+       | Read Cache           |             | admission + position |
+       +----------+-----------+             +----+------------+----+
+                  |                                |            |
+             cache miss                      enqueue/status   queue
+                  |                                |          position
+                  v                                v            |
+       +----------+-----------+             +------+------------v---+
+       | Read API / Database  |             | Durable Queue Store   |
+       | read replica or      |             | waiting users use no  |
+       | bounded read pool    |             | ticket-DB connections |
+       +----------------------+             +----------+------------+
+                                                        |
+                                        rate-limited, short-lived
+                                           admission tokens
+                                                        |
+                                            +-----------v-----------+
+                                            | Ticketing Service     |
+                                            | bounded worker count  |
+                                            | validates token       |
+                                            +-----------+-----------+
+                                                        |
+                                            +-----------v-----------+
+                                            | Bounded DB Pool       |
+                                            | max connections /     |
+                                            | transaction timeouts  |
+                                            +-----------+-----------+
+                                                        |
+                                            +-----------v-----------+
+                                            | Primary Relational DB |
+                                            | atomic seat ownership |
+                                            +-----+------------+----+
+                                                  |            |
+                                             outbox events   payment intent
+                                                  |            v
+                                                  v    +-------+----------+
+                                        +---------+--+ | Payment Provider |
+                                        | Async      | +------------------+
+                                        | Workers    |
+                                        | expiry,    |
+                                        | tickets,   |
+                                        | reconcile  |
+                                        +------------+
 ```
 
-- **Browser/mobile app and CDN:** Deliver the client and cache static assets close to users.
-- **API gateway and auth:** Authenticate users, apply request limits, and route API traffic.
-- **Event cache and read API:** Serve cacheable event details and seat-map snapshots. Availability shown here is advisory; the hold transaction rechecks it.
-- **Virtual queue service and durable queue store:** Enqueue sale entrants and report their positions using the queue store, separately from the ticketing relational database connection pool. The service admits a bounded number at a time, issuing short-lived, single-use tokens at a configured rate. While waiting, clients receive position/status from the queue service; they do not poll the ticketing service or consume ticket-database connections.
-- **Ticketing service and database connection pool:** The service validates admission tokens before starting allocation work. A bounded worker/semaphore limits concurrent database transactions, and the connection pool caps open database connections. The admission rate is calibrated below the safe write capacity of these workers and the database pool; if workers or connections are saturated, admission pauses rather than allowing requests to pile up holding connections or overwhelm the database. Requests denied or expired at the gate can retry through the queue.
-- **Relational database:** Stores users, event inventory, holds, orders, and tickets; row-level transactional updates and constraints protect seat ownership.
-- **Payment provider:** Handles sensitive payment details and returns payment status through callbacks or status queries.
-- **Workers:** Expire holds, issue ticket notifications, and reconcile delayed or failed payment events. Retryable events are recorded transactionally with database changes (outbox pattern).
+- **CDN/static cache:** Serves scripts, images, and other static content at the edge, preventing those requests from reaching application servers or the database during the rush.
+- **API gateway:** Authenticates, rate-limits, and routes requests. It rejects abusive or over-limit traffic early and keeps browsing and purchase traffic on separate paths so a sale spike does not consume every application slot.
+- **Event/seat-map read cache:** Serves popular event details and seat-map snapshots from memory. A cache miss can use a bounded read path/read replica; the displayed availability is advisory and the primary database checks seat ownership again when a hold is created.
+- **Virtual queue and durable queue store:** Accepts sale arrivals and stores waiting entries outside the ticketing database and its connection pool. The 200,000 customers are admitted at a controlled rate using short-lived, single-use tokens; users waiting for their turn read queue position/status without holding a ticket-service worker or database connection. Admission pauses when the downstream service is saturated.
+- **Ticketing service:** Validates the admission token before doing allocation work. A bounded worker count limits simultaneous hold transactions, while idempotency keys make client retries safe. It does not create unbounded request tasks waiting while holding database connections.
+- **Bounded database connection pool:** Places a hard ceiling on concurrent database sessions and uses transaction timeouts to release connections from stalled work. The queue's admission rate and ticketing worker limit are set at or below the capacity the pool and primary database can sustain; saturation applies backpressure to admission instead of creating an ever-growing database backlog.
+- **Primary relational database:** Performs the short atomic seat-hold/order transactions and enforces unique seat ownership. Only admitted, bounded write traffic reaches it, preserving the consistency guarantee under overload.
+- **Payment provider and asynchronous workers:** Payment is performed outside the seat-allocation transaction. Workers process outbox events, expire holds, issue tickets, and reconcile payment status with bounded concurrency and retries, so slow provider calls and notification work do not tie up the sale-time database pool.
 
 ## 6. Trade-offs
 
-1. **Consistency over availability for seat allocation:** A hold requires a successful database transaction, so an allocation request may fail or wait during a database outage. This avoids selling the same seat twice. Event browsing can remain available from cache with potentially stale availability.
-2. **Virtual queue versus direct access:** The queue adds waiting time and operational complexity, but absorbs the arrival burst outside the ticketing service and its relational database connection pool. It admits only as many requests as bounded ticketing workers and available database capacity can safely process; users waiting in the durable queue do not consume ticket-database connections. A too-low admission rate leaves capacity unused and lengthens the queue, while a too-high rate can saturate workers, exhaust the connection pool, and recreate the overload. Queue position, admission rate, and token expiry must be monitored and adjusted without bypassing the queue to maintain fairness and protect the database.
-3. **Temporary holds versus immediate purchase:** Holds give users time to pay and reduce checkout races, but temporarily hide seats from other buyers and require expiry/reconciliation logic. Short, explicit expirations limit this inventory lockup.
-4. **Cached seat maps versus live reads:** Caching lowers database load during a sale, but availability can become stale. Showing a clear snapshot timestamp and confirming availability only during the atomic hold operation preserves correctness.
+1. **Queue buffering versus direct database access:** A durable virtual queue and rate-limited token admission protect the bounded worker count and database connection pool from a 200,000-person arrival burst, but add queue infrastructure, operational tuning, and user wait time. Set admission below measured sustainable database throughput and pause it when workers/pool saturate. Too-conservative limits lengthen the queue and waste capacity; overly aggressive limits recreate pool exhaustion and database overload. Queue-store outages also require an explicit fail-closed or recovery policy rather than bypassing admission.
+2. **Strong consistency versus availability for seat allocation:** Conditional writes and transactions against the primary database prevent two customers from holding the same seat, but a primary-database outage or contention can reject/slow purchases even if cached pages and queue status remain available. Using eventually consistent replicas for allocation would improve responsiveness but risks overselling; replicas are therefore limited to reads, and the primary rechecks ownership on every hold.
+3. **Cached reads versus live availability:** Caching event details and seat maps reduces database read load during the sale, but availability can be stale and cache invalidation adds complexity. Display a snapshot timestamp and treat it only as a hint; the atomic hold operation is authoritative.
+4. **Short holds versus checkout convenience:** A hold gives customers time to pay but temporarily removes inventory from others and needs expiry workers plus payment reconciliation. Short, explicit expirations reduce stranded seats, while overly short holds penalize customers with slow checkout or payment-provider delays.
